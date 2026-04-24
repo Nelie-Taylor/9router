@@ -89,6 +89,79 @@ function migrateHistoryToDailySummary(db) {
   return true;
 }
 
+function buildRecentRequests(history = [], limit = 20) {
+  const seen = new Set();
+  return [...history]
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+    .map((entry) => {
+      const tokens = entry.tokens || {};
+      return {
+        timestamp: entry.timestamp,
+        model: entry.model,
+        provider: entry.provider || "",
+        promptTokens: tokens.prompt_tokens || tokens.input_tokens || 0,
+        completionTokens: tokens.completion_tokens || tokens.output_tokens || 0,
+        status: entry.status || "ok",
+      };
+    })
+    .filter((entry) => {
+      if (entry.promptTokens === 0 && entry.completionTokens === 0) return false;
+      const minute = entry.timestamp ? entry.timestamp.slice(0, 16) : "";
+      const key = `${entry.model}|${entry.provider}|${entry.promptTokens}|${entry.completionTokens}|${minute}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit);
+}
+
+async function getConnectionMap() {
+  try {
+    const { getProviderConnections } = await import("@/lib/localDb.js");
+    const allConnections = await getProviderConnections();
+    return Object.fromEntries(allConnections.map((conn) => [conn.id, conn.name || conn.email || conn.id]));
+  } catch {
+    return {};
+  }
+}
+
+function buildActiveRequests(connectionMap = {}) {
+  const activeRequests = [];
+  for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
+    for (const [modelKey, count] of Object.entries(models)) {
+      if (count > 0) {
+        const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
+        const match = modelKey.match(/^(.*) \((.*)\)$/);
+        const modelName = match ? match[1] : modelKey;
+        const providerName = match ? match[2] : "unknown";
+        activeRequests.push({ model: modelName, provider: providerName, account: accountName, count });
+      }
+    }
+  }
+  return activeRequests;
+}
+
+function getLiveErrorProvider() {
+  return (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "";
+}
+
+export async function getLiveUsageSnapshot() {
+  const db = await getUsageDb();
+  const history = db.data.history || [];
+  const connectionMap = await getConnectionMap();
+  return {
+    activeRequests: buildActiveRequests(connectionMap),
+    recentRequests: buildRecentRequests(history),
+    errorProvider: getLiveErrorProvider(),
+  };
+}
+
+export async function getActiveRequests() {
+  return getLiveUsageSnapshot();
+}
+
+export { buildRecentRequests };
+
 // Singleton instance
 let dbInstance = null;
 
@@ -179,63 +252,6 @@ export function trackPendingRequest(model, provider, connectionId, started, erro
   const t = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
   console.log(`[${t}] [PENDING] ${started ? "START" : "END"}${error ? " (ERROR)" : ""} | provider=${provider} | model=${model}`);
   statsEmitter.emit("pending");
-}
-
-/**
- * Lightweight: get only activeRequests + recentRequests without full stats recalc
- */
-export async function getActiveRequests() {
-  const activeRequests = [];
-
-  // Build active requests from pending state
-  let connectionMap = {};
-  try {
-    const { getProviderConnections } = await import("@/lib/localDb.js");
-    const allConnections = await getProviderConnections();
-    for (const conn of allConnections) {
-      connectionMap[conn.id] = conn.name || conn.email || conn.id;
-    }
-  } catch {}
-
-  for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
-    for (const [modelKey, count] of Object.entries(models)) {
-      if (count > 0) {
-        const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
-        const match = modelKey.match(/^(.*) \((.*)\)$/);
-        const modelName = match ? match[1] : modelKey;
-        const providerName = match ? match[2] : "unknown";
-        activeRequests.push({ model: modelName, provider: providerName, account: accountName, count });
-      }
-    }
-  }
-
-  // Get recent requests from history (re-read to get latest)
-  const db = await getUsageDb();
-  await db.read();
-  const history = db.data.history || [];
-  const seen = new Set();
-  const recentRequests = [...history]
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    .map((e) => {
-      const t = e.tokens || {};
-      const promptTokens = t.prompt_tokens || t.input_tokens || 0;
-      const completionTokens = t.completion_tokens || t.output_tokens || 0;
-      return { timestamp: e.timestamp, model: e.model, provider: e.provider || "", promptTokens, completionTokens, status: e.status || "ok" };
-    })
-    .filter((e) => {
-      if (e.promptTokens === 0 && e.completionTokens === 0) return false;
-      const minute = e.timestamp ? e.timestamp.slice(0, 16) : "";
-      const key = `${e.model}|${e.provider}|${e.promptTokens}|${e.completionTokens}|${minute}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 20);
-
-  // Error provider (auto-clear after 10s)
-  const errorProvider = (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "";
-
-  return { activeRequests, recentRequests, errorProvider };
 }
 
 /**
@@ -621,27 +637,7 @@ export async function getUsageStats(period = "all") {
   }
 
   // Recent requests (always from live history)
-  const seen = new Set();
-  const recentRequests = [...history]
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    .map((e) => {
-      const t = e.tokens || {};
-      return {
-        timestamp: e.timestamp, model: e.model, provider: e.provider || "",
-        promptTokens: t.prompt_tokens || t.input_tokens || 0,
-        completionTokens: t.completion_tokens || t.output_tokens || 0,
-        status: e.status || "ok",
-      };
-    })
-    .filter((e) => {
-      if (e.promptTokens === 0 && e.completionTokens === 0) return false;
-      const minute = e.timestamp ? e.timestamp.slice(0, 16) : "";
-      const key = `${e.model}|${e.provider}|${e.promptTokens}|${e.completionTokens}|${minute}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 20);
+  const recentRequests = buildRecentRequests(history);
 
   const lifetimeTotalRequests = typeof db.data.totalRequestsLifetime === "number"
     ? db.data.totalRequestsLifetime
@@ -655,23 +651,11 @@ export async function getUsageStats(period = "all") {
     pending: pendingRequests,
     activeRequests: [],
     recentRequests,
-    errorProvider: (Date.now() - lastErrorProvider.ts < 10000) ? lastErrorProvider.provider : "",
+    errorProvider: getLiveErrorProvider(),
   };
 
   // Active requests from pending
-  for (const [connectionId, models] of Object.entries(pendingRequests.byAccount)) {
-    for (const [modelKey, count] of Object.entries(models)) {
-      if (count > 0) {
-        const accountName = connectionMap[connectionId] || `Account ${connectionId.slice(0, 8)}...`;
-        const match = modelKey.match(/^(.*) \((.*)\)$/);
-        stats.activeRequests.push({
-          model: match ? match[1] : modelKey,
-          provider: match ? match[2] : "unknown",
-          account: accountName, count,
-        });
-      }
-    }
-  }
+  stats.activeRequests = buildActiveRequests(connectionMap);
 
   // last10Minutes — always from live history
   const now = new Date();

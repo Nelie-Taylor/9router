@@ -4,7 +4,7 @@ import { useState, useMemo, useEffect } from "react";
 import PropTypes from "prop-types";
 import Modal from "./Modal";
 import { getModelsByProviderId } from "@/shared/constants/models";
-import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, getProviderAlias } from "@/shared/constants/providers";
+import { OAUTH_PROVIDERS, APIKEY_PROVIDERS, FREE_PROVIDERS, FREE_TIER_PROVIDERS, AI_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, getProviderAlias } from "@/shared/constants/providers";
 
 // Provider order: OAuth first, then Free Tier, then API Key (matches dashboard/providers)
 const PROVIDER_ORDER = [
@@ -25,7 +25,17 @@ export default function ModelSelectModal({
   activeProviders = [],
   title = "Select Model",
   modelAliases = {},
+  kindFilter = null,
 }) {
+  // Filter activeProviders by serviceKinds when kindFilter set (e.g. "webSearch", "webFetch")
+  const filteredActiveProviders = useMemo(() => {
+    if (!kindFilter) return activeProviders;
+    return activeProviders.filter((p) => {
+      const info = AI_PROVIDERS[p.provider];
+      const kinds = info?.serviceKinds || ["llm"];
+      return kinds.includes(kindFilter);
+    });
+  }, [activeProviders, kindFilter]);
   const [searchQuery, setSearchQuery] = useState("");
   const [combos, setCombos] = useState([]);
   const [providerNodes, setProviderNodes] = useState([]);
@@ -85,13 +95,31 @@ export default function ModelSelectModal({
   const groupedModels = useMemo(() => {
     const groups = {};
 
-    // Get all active provider IDs from connections
-    const activeConnectionIds = activeProviders.map(p => p.provider);
+    // Kinds where the provider IS the model (no per-model selection needed)
+    const PROVIDER_AS_MODEL_KINDS = new Set(["webSearch", "webFetch"]);
+    // Kinds that map directly to model.type field
+    const TYPED_KINDS = new Set(["image", "tts", "stt", "embedding", "imageToText"]);
+    // For these kinds, providers without hardcoded models can still be picked (provider-as-model fallback)
+    const ALLOW_PROVIDER_FALLBACK_KINDS = new Set(["tts", "image", "webFetch"]);
+
+    // Filter a models[] array by kindFilter (keep only matching m.type)
+    const filterByKind = (models) => {
+      if (!kindFilter || !TYPED_KINDS.has(kindFilter)) return models;
+      return models.filter((m) => m.isPlaceholder || m.type === kindFilter);
+    };
+
+    // Get all active provider IDs from connections (filtered by kindFilter if set)
+    const activeConnectionIds = filteredActiveProviders.map(p => p.provider);
+
+    // No-auth providers: filter by kindFilter as well
+    const noAuthIds = kindFilter
+      ? NO_AUTH_PROVIDER_IDS.filter((id) => (AI_PROVIDERS[id]?.serviceKinds || ["llm"]).includes(kindFilter))
+      : NO_AUTH_PROVIDER_IDS;
 
     // Only show connected providers (including both standard and custom)
     const providerIdsToShow = new Set([
       ...activeConnectionIds,  // Only connected providers
-      ...NO_AUTH_PROVIDER_IDS, // No-auth providers always visible
+      ...noAuthIds,            // No-auth providers (kind-filtered)
     ]);
 
     // Sort by PROVIDER_ORDER
@@ -106,6 +134,17 @@ export default function ModelSelectModal({
       const providerInfo = allProviders[providerId] || { name: providerId, color: "#666" };
       const isCustomProvider = isOpenAICompatibleProvider(providerId) || isAnthropicCompatibleProvider(providerId);
 
+      // For provider-as-model kinds (webSearch/webFetch): emit a single entry where value === providerId
+      if (kindFilter && PROVIDER_AS_MODEL_KINDS.has(kindFilter)) {
+        groups[providerId] = {
+          name: providerInfo.name,
+          alias,
+          color: providerInfo.color,
+          models: [{ id: providerId, name: providerInfo.name, value: providerId }],
+        };
+        return;
+      }
+
       if (providerInfo.passthroughModels) {
         const aliasModels = Object.entries(modelAliases)
           .filter(([, fullModel]) => fullModel.startsWith(`${alias}/`))
@@ -115,7 +154,20 @@ export default function ModelSelectModal({
             value: fullModel,
           }));
 
-        if (aliasModels.length > 0) {
+        // For typed kinds, only include hardcoded typed models (aliases are typically LLM-only and lack type info)
+        let combined = aliasModels;
+        if (kindFilter && TYPED_KINDS.has(kindFilter)) {
+          combined = getModelsByProviderId(providerId)
+            .filter((m) => m.type === kindFilter)
+            .map((m) => ({ id: m.id, name: m.name, value: `${alias}/${m.id}`, type: m.type }));
+          // Fallback: provider-as-model when no hardcoded models match (tts/image/webFetch only)
+          if (combined.length === 0 && ALLOW_PROVIDER_FALLBACK_KINDS.has(kindFilter)) {
+            const supports = (providerInfo.serviceKinds || ["llm"]).includes(kindFilter);
+            if (supports) combined = [{ id: providerId, name: providerInfo.name, value: alias }];
+          }
+        }
+
+        if (combined.length > 0) {
           // Check for custom name from providerNodes (for compatible providers)
           const matchedNode = providerNodes.find(node => node.id === providerId);
           const displayName = matchedNode?.name || providerInfo.name;
@@ -124,10 +176,12 @@ export default function ModelSelectModal({
             name: displayName,
             alias: alias,
             color: providerInfo.color,
-            models: aliasModels,
+            models: combined,
           };
         }
       } else if (isCustomProvider) {
+        // Custom (openai/anthropic-compatible) providers are LLM-only — skip for typed media kinds
+        if (kindFilter && TYPED_KINDS.has(kindFilter)) return;
         // Find connection object to get prefix synchronously without waiting for providerNodes fetch
         const connection = activeProviders.find(p => p.provider === providerId);
         const matchedNode = providerNodes.find(node => node.id === providerId);
@@ -185,11 +239,20 @@ export default function ModelSelectModal({
           .filter((m) => m.providerAlias === alias && !hardcodedIds.has(m.id) && !customAliasIds.has(m.id))
           .map((m) => ({ id: m.id, name: m.name || m.id, value: `${alias}/${m.id}`, isCustom: true }));
 
-        const allModels = [
-          ...hardcodedModels.map((m) => ({ id: m.id, name: m.name, value: `${alias}/${m.id}` })),
+        let allModels = filterByKind([
+          ...hardcodedModels.map((m) => ({ id: m.id, name: m.name, value: `${alias}/${m.id}`, type: m.type })),
           ...customAliasModels,
           ...customRegisteredModels,
-        ];
+        ]);
+
+        // Provider-as-model fallback: providers that support the kind but have no hardcoded models
+        // can still be picked (value = providerAlias). Skips embedding (always needs model).
+        if (allModels.length === 0 && kindFilter && ALLOW_PROVIDER_FALLBACK_KINDS.has(kindFilter)) {
+          const supports = (providerInfo.serviceKinds || ["llm"]).includes(kindFilter);
+          if (supports) {
+            allModels = [{ id: providerId, name: providerInfo.name, value: alias }];
+          }
+        }
 
         if (allModels.length > 0) {
           groups[providerId] = {
@@ -203,14 +266,15 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [activeProviders, modelAliases, allProviders, providerNodes, customModels]);
+  }, [filteredActiveProviders, modelAliases, allProviders, providerNodes, customModels, kindFilter]);
 
-  // Filter combos by search query
+  // Filter combos by search query (and hide combos when kindFilter is set — combos are LLM-only by design)
   const filteredCombos = useMemo(() => {
+    if (kindFilter) return [];
     if (!searchQuery.trim()) return combos;
     const query = searchQuery.toLowerCase();
     return combos.filter(c => c.name.toLowerCase().includes(query));
-  }, [combos, searchQuery]);
+  }, [combos, searchQuery, kindFilter]);
 
   // Filter models by search query
   const filteredGroups = useMemo(() => {
@@ -384,5 +448,6 @@ ModelSelectModal.propTypes = {
   ),
   title: PropTypes.string,
   modelAliases: PropTypes.object,
+  kindFilter: PropTypes.string,
 };
 
